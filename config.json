@@ -1,0 +1,12 @@
+{
+  "listen_host": "0.0.0.0",
+  "ws_port": 8765,
+  "interface": "enp108s0",
+  "central_host": "",
+  "layout": "circle",
+  "exclude": [
+    "127.0.0.0/8",
+    "224.0.0.0/4",
+    "255.255.255.255"
+  ]
+}

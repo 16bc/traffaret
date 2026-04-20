@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#07111e;overflow:hidden;font-family:monospace;color:#fff}
+canvas{display:block;position:absolute;top:0;left:0}
+#wrap{position:relative;width:100vw;height:100vh}
+#hud{position:absolute;top:0;left:0;right:0;display:flex;gap:0;z-index:10;
+  background:rgba(7,17,30,0.85);border-bottom:1px solid rgba(55,138,221,0.18)}
+.sc{padding:10px 20px;border-right:1px solid rgba(55,138,221,0.12)}
+.sv{font-size:20px;font-weight:500;color:#85B7EB;letter-spacing:0.02em}
+.sl{font-size:10px;color:rgba(133,183,235,0.45);letter-spacing:0.1em;margin-top:1px}
+#controls{margin-left:auto;display:flex;align-items:stretch}
+#ifacebox,#centerbox,#ws{padding:10px 12px;display:flex;align-items:center;gap:8px;
+  border-left:1px solid rgba(55,138,221,0.12)}
+.ctl{font-size:10px;letter-spacing:0.10em;color:rgba(133,183,235,0.45)}
+#iface,#center{min-width:120px;height:30px;padding:0 8px;border:1px solid rgba(55,138,221,0.20);
+  background:#0b1828;color:#85B7EB;font:11px monospace}
+#iface:disabled,#center:disabled{opacity:0.55}
+#layoutbtn,#settingsbtn,#fullscreenbtn,#logpausebtn,#settingsapply,#settingsreset,#settingsclose{padding:0 14px;border:0;background:rgba(55,138,221,0.12);
+  color:#85B7EB;font:11px monospace;cursor:pointer;letter-spacing:0.06em}
+#layoutbtn:hover,#settingsbtn:hover,#fullscreenbtn:hover,#logpausebtn:hover,#settingsapply:hover,#settingsreset:hover,#settingsclose:hover{background:rgba(55,138,221,0.18)}
+.dot{width:7px;height:7px;border-radius:50%;background:#E24B4A}
+.dot.ok{background:#1D9E75}
+#panel{position:absolute;top:52px;right:0;bottom:0;width:240px;z-index:10;
+  background:rgba(7,17,30,0.92);border-left:1px solid rgba(55,138,221,0.12);
+  display:flex;flex-direction:column;gap:0}
+#legend{padding:14px 14px 10px;display:flex;flex-direction:column;gap:6px;
+  border-bottom:1px solid rgba(55,138,221,0.10)}
+.li{display:flex;align-items:center;gap:7px;font-size:11px;color:rgba(255,255,255,0.45)}
+.ld{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+#loghead{padding:8px 10px 4px 14px;display:flex;align-items:center;justify-content:space-between}
+#logtitle{font-size:9px;letter-spacing:0.12em;
+  color:rgba(133,183,235,0.30)}
+#logpausebtn{height:24px;padding:0 10px;font-size:10px}
+#logpausebtn.paused{background:rgba(226,75,74,0.18);color:#ffd0d0}
+#log{flex:1;padding:0 14px 10px;font-size:10.5px;line-height:1.85;
+  color:rgba(133,183,235,0.55);overflow:hidden}
+#settingsoverlay{position:absolute;inset:0;z-index:30;background:rgba(7,17,30,0.72);display:flex;align-items:center;justify-content:center}
+#settingsoverlay[hidden]{display:none}
+#settingsmodal{width:min(860px,calc(100vw - 32px));max-height:calc(100vh - 60px);overflow:hidden;
+  background:#0b1828;border:1px solid rgba(55,138,221,0.24);box-shadow:0 24px 80px rgba(0,0,0,0.45);
+  display:flex;flex-direction:column}
+#settingshead{padding:14px 16px;border-bottom:1px solid rgba(55,138,221,0.12);display:flex;align-items:center;justify-content:space-between}
+#settingstitle{font-size:12px;letter-spacing:0.10em;color:#85B7EB}
+#settingsbody{padding:14px 16px;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.sg{border:1px solid rgba(55,138,221,0.12);padding:12px;background:rgba(255,255,255,0.02)}
+.sgt{margin-bottom:10px;font-size:10px;letter-spacing:0.12em;color:rgba(133,183,235,0.42)}
+.sr{display:grid;grid-template-columns:1fr minmax(110px,150px);gap:10px;align-items:center;margin-bottom:8px}
+.slbl{display:flex;align-items:center;gap:6px;font-size:11px;color:rgba(255,255,255,0.82)}
+.stip{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
+  border:1px solid rgba(55,138,221,0.25);font-size:10px;color:#85B7EB;cursor:help}
+.sinput,.sselect{width:100%;height:28px;padding:0 8px;border:1px solid rgba(55,138,221,0.20);background:#07111e;color:#85B7EB;font:11px monospace}
+#settingsfoot{padding:12px 16px;border-top:1px solid rgba(55,138,221,0.12);display:flex;justify-content:flex-end;gap:8px}
+</style>
+</head>
+<body>
+<div id="wrap">
+<canvas id="c"></canvas>
+<div id="hud">
+  <div class="sc"><div class="sv" id="spps">0</div><div class="sl">PKT/S</div></div>
+  <div class="sc"><div class="sv" id="sbps">0 B</div><div class="sl">BYTES/S</div></div>
+  <div class="sc"><div class="sv" id="snodes">0</div><div class="sl">NODES</div></div>
+  <div class="sc"><div class="sv" id="sflows">0</div><div class="sl">FLOWS</div></div>
+  <div id="controls">
+    <div id="ifacebox"><span class="ctl">IFACE</span><select id="iface"></select></div>
+    <div id="centerbox"><span class="ctl">CENTER</span><select id="center"></select></div>
+    <button id="layoutbtn" type="button">layout: circle</button>
+    <button id="fullscreenbtn" type="button">fullscreen</button>
+    <button id="settingsbtn" type="button">settings</button>
+    <div id="ws"><div class="dot" id="wsdot"></div><span id="wstxt">connecting…</span></div>
+  </div>
+</div>
+<div id="panel">
+  <div id="legend"></div>
+  <div id="loghead"><div id="logtitle">PACKET LOG</div><button id="logpausebtn" type="button">pause</button></div>
+  <div id="log"></div>
+</div>
+</div>
+<div id="settingsoverlay" hidden>
+  <div id="settingsmodal">
+    <div id="settingshead"><div id="settingstitle">VISUAL SETTINGS</div><button id="settingsclose" type="button">close</button></div>
+    <div id="settingsbody"></div>
+    <div id="settingsfoot"><button id="settingsreset" type="button">defaults</button><button id="settingsapply" type="button">apply</button></div>
+  </div>
+</div>
+<script src="client_config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
