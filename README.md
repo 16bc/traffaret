@@ -1,7 +1,3 @@
-# 🗦 Traffaret 🗧
-
-A minimalist real-time network traffic visualizer for OpenWrt and Linux routers.
-
 # Tʀᴀғғᴀʀᴇᴛ
 
 Traffaret is a minimalist real-time network traffic visualizer for OpenWrt and Linux routers.
