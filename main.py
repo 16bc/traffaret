@@ -1,9 +1,10 @@
-import argparse, asyncio, ipaddress, json, pathlib, re, socket, subprocess
+import argparse, asyncio, collections, ipaddress, json, pathlib, re, signal, socket, subprocess, time
 import websockets
 
 ROOT = pathlib.Path(__file__).resolve().parent
 SYS_NET = pathlib.Path("/sys/class/net")
 BROADCAST_IP = "255.255.255.255"
+FLUSH_INTERVAL = 0.03  # интервал накопления пакетов перед отправкой (сек)
 
 DEFAULT_CONFIG = {
     "listen_host": "0.0.0.0",
@@ -14,12 +15,14 @@ DEFAULT_CONFIG = {
     "exclude": [],
 }
 TCPDUMP_RE = re.compile(
-    r"(\d{1,3}(?:\.\d{1,3}){3})\.?([0-9]+)?\s+>\s+(\d{1,3}(?:\.\d{1,3}){3})\.?([0-9]+)?:\s+(\w+)",
+    r"(\d{1,3}(?:\.\d{1,3}){3})\.?([0-9]+)?\s+>\s+(\d{1,3}(?:\.\d{1,3}){3})\.?([0-9]+)?:\s+(\w+)"
+    r"(?:\s+(\d+)|.*?\blength\s+(\d+))?",
     re.IGNORECASE,
 )
 
 CLIENTS = {}
-_hostname_cache = {}
+_HOSTNAME_CACHE_MAX = 1000
+_hostname_cache = collections.OrderedDict()
 _hostname_pending = set()
 
 
@@ -78,15 +81,17 @@ def runtime_config(cfg: dict) -> dict:
     interfaces = list_interfaces()
     if cfg["interface"] and cfg["interface"] not in interfaces:
         interfaces.insert(0, cfg["interface"])
-    return {
+    result = {
         "type": "config",
         "interface": cfg["interface"],
         "interfaces": interfaces,
-        "central_host": cfg["central_host"],
         "exclude": cfg["exclude"],
         "layout": cfg["layout"],
         "ws_port": cfg["ws_port"],
     }
+    if cfg["central_host"]:
+        result["central_host"] = cfg["central_host"]
+    return result
 
 
 def compile_excludes(values: list[str]) -> list[ipaddress._BaseNetwork]:
@@ -107,19 +112,51 @@ def is_excluded(ip: str, nets: list[ipaddress._BaseNetwork]) -> bool:
     return any(addr in net for net in nets)
 
 
+HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$")
+
+
+def validate_center_host(host: str) -> str:
+    """Проверка центрального хоста: валидный IP или hostname без HTML-спецсимволов"""
+    host = host.strip()
+    if not host:
+        raise ValueError("Center host cannot be empty")
+    if len(host) > 253:
+        raise ValueError("Center host is too long")
+    if any(ch in host for ch in "<>&\"'"):
+        raise ValueError("Center host contains invalid characters")
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    if not HOST_RE.match(host):
+        raise ValueError("Center host must be a valid IP or hostname")
+    return host
+
+
 async def _resolve(ip: str):
     loop = asyncio.get_running_loop()
+    value = ip
     try:
         result = await asyncio.wait_for(loop.run_in_executor(None, socket.gethostbyaddr, ip), timeout=3.0)
-        _hostname_cache[ip] = result[0]
+        value = result[0]
     except Exception:
-        _hostname_cache[ip] = ip
+        value = ip
     finally:
         _hostname_pending.discard(ip)
+    _cache_set(ip, value)
+
+
+def _cache_set(ip: str, value: str):
+    _hostname_cache.pop(ip, None)
+    _hostname_cache[ip] = value
+    while len(_hostname_cache) > _HOSTNAME_CACHE_MAX:
+        _hostname_cache.popitem(last=False)
 
 
 def hostname(ip: str) -> str:
     if ip in _hostname_cache:
+        _hostname_cache.move_to_end(ip)
         return _hostname_cache[ip]
     if ip not in _hostname_pending:
         _hostname_pending.add(ip)
@@ -141,12 +178,9 @@ async def safe_send(ws, payload: dict) -> bool:
 
 
 async def broadcast(payload: dict):
-    stale = []
+    # safe_send сам удаляет мёртвый сокет из CLIENTS при ошибке отправки
     for ws in tuple(CLIENTS):
-        if not await safe_send(ws, payload):
-            stale.append(ws)
-    for ws in stale:
-        CLIENTS.pop(ws, None)
+        await safe_send(ws, payload)
 
 
 async def tcpdump_reader(cfg: dict):
@@ -154,8 +188,19 @@ async def tcpdump_reader(cfg: dict):
     proc = await asyncio.create_subprocess_exec(
         "tcpdump", "-l", "-n", "-q", "-i", interface,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
     )
+    batch = []
+    last_flush = time.monotonic()
+
+    async def flush():
+        nonlocal last_flush
+        if batch:
+            # Отправляем накопленные пакеты одним сообщением-массивом
+            await broadcast({"packets": batch})
+            batch.clear()
+        last_flush = time.monotonic()
+
     try:
         while True:
             line = await proc.stdout.readline()
@@ -164,24 +209,27 @@ async def tcpdump_reader(cfg: dict):
             match = TCPDUMP_RE.search(line.decode(errors="ignore"))
             if not match:
                 continue
-            src, sport, dst, dport, proto = match.groups()
+            src, sport, dst, dport, proto, tcp_len, pkt_len = match.groups()
             if src == BROADCAST_IP or dst == BROADCAST_IP:
                 continue
             if is_excluded(src, cfg["exclude_nets"]) or is_excluded(dst, cfg["exclude_nets"]):
                 continue
-            await broadcast({
+            batch.append({
                 "src": src,
                 "sport": sport or "0",
                 "dst": dst,
                 "dport": dport or "0",
                 "proto": proto.upper(),
+                "len": int(pkt_len or tcp_len or 0),
                 "host_src": hostname(src),
                 "host_dst": hostname(dst),
             })
+            if time.monotonic() - last_flush >= FLUSH_INTERVAL:
+                await flush()
+        await flush()
         rc = await proc.wait()
         if rc:
-            err = (await proc.stderr.read()).decode(errors="ignore").strip()
-            raise RuntimeError(err or f"tcpdump exited for interface {interface}")
+            raise RuntimeError(f"tcpdump exited with code {rc} for interface {interface}")
     except asyncio.CancelledError:
         if proc.returncode is None:
             proc.terminate()
@@ -234,9 +282,7 @@ class CaptureController:
             await broadcast(runtime_config(self.cfg))
 
     async def set_center(self, host: str):
-        host = host.strip()
-        if not host:
-            raise ValueError("Center host cannot be empty")
+        host = validate_center_host(host)
         self.cfg["central_host"] = host
         await broadcast(runtime_config(self.cfg))
 
@@ -274,6 +320,8 @@ async def main():
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(msg, dict):
+                    continue
                 if msg.get("type") == "get_config":
                     await safe_send(ws, runtime_config(cfg))
                 if msg.get("type") == "set_interface":
@@ -289,10 +337,30 @@ async def main():
         finally:
             CLIENTS.pop(ws, None)
 
-    ws_server = await websockets.serve(handler, cfg["listen_host"], cfg["ws_port"])
+    ws_server = await websockets.serve(
+        handler, cfg["listen_host"], cfg["ws_port"],
+        ping_interval=20,
+        ping_timeout=20,
+    )
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _request_stop():
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:
+            # Платформа не поддерживает add_signal_handler (например, Windows)
+            pass
+
     try:
-        await ws_server.wait_closed()
+        await stop_event.wait()
     finally:
+        ws_server.close()
+        await ws_server.wait_closed()
         await controller.stop()
 
 

@@ -182,6 +182,7 @@ const logLines = [];
 const hiddenHosts = new Set();
 
 const isLocal = ip => /^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(ip);
+const escapeHtml = s => String(s).replace(/[&<>"']/g, c => '&#' + c.charCodeAt(0) + ';');
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const hashIp = (ip, salt = 0) => `${ip}:${salt}`.split('').reduce((a, ch) => (a * 33 + ch.charCodeAt(0)) >>> 0, 5381);
 const unit = (ip, salt = 0) => (hashIp(ip, salt) % 1000) / 999;
@@ -290,9 +291,23 @@ function updateStats() {
   statFlowsEl.textContent = [...flows.values()].filter(f => !isFlowHidden(f)).length;
 }
 
+let _logFramePending = false;
+
 function renderLog(force = false) {
   if (logPaused && !force) return;
-  logEl.innerHTML = logLines.join('<br>');
+  const doRender = () => {
+    _logFramePending = false;
+    logEl.innerHTML = logLines.map(e =>
+      e.count > 1 ? `${e.html}<span style="color:rgba(255,255,255,0.4)"> ×${e.count}</span>` : e.html
+    ).join('<br>');
+  };
+  if (force) {
+    doRender();
+    return;
+  }
+  if (_logFramePending) return;
+  _logFramePending = true;
+  requestAnimationFrame(doRender);
 }
 
 function updateLogPauseButton() {
@@ -300,14 +315,20 @@ function updateLogPauseButton() {
   logPauseBtn.classList.toggle('paused', logPaused);
 }
 
-function pushLog(line) {
-  logLines.unshift(line);
+function pushLog(line, key) {
+  const last = logLines[0];
+  if (key != null && last && last.key === key) {
+    last.count++;
+    renderLog();
+    return;
+  }
+  logLines.unshift({key: key ?? null, html: line, count: 1});
   if (logLines.length > 14) logLines.pop();
   renderLog();
 }
 
 function pushSystemLog(text) {
-  pushLog(`<span style="color:rgba(255,255,255,0.35)">SYS</span> ${text}`);
+  pushLog(`<span style="color:rgba(255,255,255,0.35)">SYS</span> ${escapeHtml(text)}`);
 }
 
 function resetScene(note = '') {
@@ -330,7 +351,7 @@ function resetScene(note = '') {
 
 function syncNodeRoles() {
   nodes.forEach(n => {
-    n.central = n.ip === CFG.CENTRAL_HOST;
+    n.central = !!CFG.CENTRAL_HOST && n.ip === CFG.CENTRAL_HOST;
     n.loc = n.central || isLocal(n.ip);
   });
 }
@@ -605,7 +626,10 @@ function applySettingsForm() {
   }
   closeSettings();
   persistRuntimeSettings();
-  if (socket && socket.readyState === WebSocket.OPEN && prevWsUrl !== buildWsUrl()) socket.close();
+  if (socket && socket.readyState === WebSocket.OPEN && prevWsUrl !== buildWsUrl()) {
+    socket.close();
+    connect();
+  }
 }
 
 function resetSettingsForm() {
@@ -678,7 +702,7 @@ function relayout() {
 }
 
 function ensureCentralNode() {
-  if (CFG.CENTRAL_HOST) getNode(CFG.CENTRAL_HOST);
+  if (CFG.CENTRAL_HOST && CFG.CENTRAL_HOST.trim()) getNode(CFG.CENTRAL_HOST);
 }
 
 function getNode(ip) {
@@ -705,7 +729,7 @@ function processPacket(d) {
   const proto = resolveProto(d.proto, d.sport, d.dport);
   const key = `${d.src}>${d.dst}>${proto}`;
   let f = flows.get(key);
-  const packetBytes = d.len || 64;
+  const packetBytes = (typeof d.len === 'number' && Number.isFinite(d.len)) ? d.len : 64;
   if (!f) {
     const src = getNode(d.src), dst = getNode(d.dst);
     const {cpx, cpy} = bezierCP(src, dst);
@@ -735,7 +759,8 @@ function processPacket(d) {
     if (CFG.SHOW_DNS_NAMES) f.dst.label = d.host_dst;
   }
   if (isFlowHidden(f)) return;
-  pushLog(`<span style="color:${f.color}">${proto.padEnd(4)}</span> ${f.src.label}:${(d.sport || '').toString().padEnd(5)} → ${f.dst.label}:${d.dport || ''}`);
+  const logKey = `${d.src}:${d.sport || ''}>${d.dst}:${d.dport || ''}>${proto}`;
+  pushLog(`<span style="color:${f.color}">${escapeHtml(proto.padEnd(4))}</span> ${escapeHtml(f.src.label)}:${escapeHtml((d.sport || '').toString().padEnd(5))} → ${escapeHtml(f.dst.label)}:${escapeHtml(String(d.dport || ''))}`, logKey);
 }
 
 function bezierPt(t, x0, y0, cx, cy, x1, y1) {
@@ -997,7 +1022,13 @@ function buildWsUrl() {
   return `${CFG.WS_SCHEME}://${host}:${CFG.WS_PORT}`;
 }
 
+let _reconnectTimer = null;
+
 function connect() {
+  if (_reconnectTimer) {
+    clearTimeout(_reconnectTimer);
+    _reconnectTimer = null;
+  }
   const ws = new WebSocket(buildWsUrl());
   socket = ws;
   updateInterfaceSelect();
@@ -1013,16 +1044,21 @@ function connect() {
       const msg = JSON.parse(e.data);
       if (msg.type === 'config') applyServerConfig(msg);
       else if (msg.type === 'error') applyServerError(msg);
-      else processPacket(msg);
+      else if (Array.isArray(msg.packets)) {
+        msg.packets.forEach(p => processPacket(p));
+      } else {
+        processPacket(msg);
+      }
     } catch (_) {}
   };
   ws.onclose = () => {
-    if (socket === ws) socket = null;
+    if (socket !== ws) return; // устаревший сокет — новое соединение уже создано
+    socket = null;
     dot.className = 'dot';
     txt.textContent = 'reconnecting…';
     updateInterfaceSelect();
     updateCenterSelect();
-    setTimeout(connect, 3000);
+    _reconnectTimer = setTimeout(connect, 3000);
   };
 }
 
