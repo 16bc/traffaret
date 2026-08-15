@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import argparse, asyncio, collections, ipaddress, json, pathlib, re, signal, socket, subprocess, time
 import websockets
 
