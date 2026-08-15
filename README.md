@@ -2,6 +2,10 @@
 
 A minimalist real-time network traffic visualizer for OpenWrt and Linux routers.
 
+# Tʀᴀғғᴀʀᴇᴛ
+
+Traffaret is a minimalist real-time network traffic visualizer for OpenWrt and Linux routers.
+
 https://github.com/user-attachments/assets/dd4da7ae-1b25-4f74-8c98-2f1d6a4b1429
 
 - **Server** — Python (`asyncio` + `websockets`), captures packets via `tcpdump`
