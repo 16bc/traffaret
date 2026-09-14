@@ -94,12 +94,23 @@ editing the file.
 python3 main.py
 ```
 
-The server reads `config.json`, starts the WebSocket listener, and launches `tcpdump` on
-the configured interface. A custom config path can be supplied with `--config`:
+The server reads `config.json` and starts the WebSocket listener. Packet capture is started
+only when at least one browser client is connected, so the server stays idle when nobody is
+watching. A custom config path can be supplied with `--config`:
 
 ```bash
 python3 main.py --config /etc/trafaret/config.json
 ```
+
+### Capture on demand
+
+`tcpdump` is started when the first client connects and stopped when the last client
+disconnects. There is no background capture, packet parsing, or DNS resolution while no
+client is connected, so an always-on server does not consume CPU in idle state.
+
+If `tcpdump` exits unexpectedly while at least one client is still connected, the server
+retries the capture after a short delay. Selecting a different interface restarts the capture
+immediately; doing so with no clients connected only stores the new interface.
 
 ---
 

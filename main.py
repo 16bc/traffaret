@@ -7,6 +7,7 @@ ROOT = pathlib.Path(__file__).resolve().parent
 SYS_NET = pathlib.Path("/sys/class/net")
 BROADCAST_IP = "255.255.255.255"
 FLUSH_INTERVAL = 0.03  # интервал накопления пакетов перед отправкой (сек)
+CAPTURE_RESTART_DELAY = 2.0  # пауза перед перезапуском упавшего tcpdump (сек)
 
 DEFAULT_CONFIG = {
     "listen_host": "0.0.0.0",
@@ -248,38 +249,57 @@ class CaptureController:
         self.cfg = cfg
         self.task = None
         self.lock = asyncio.Lock()
+        self.wanted = False  # должен ли сейчас идти захват (есть хотя бы один клиент)
 
     async def start(self):
+        # При старте сервера захват не запускается: он включается при подключении клиента
         await self.set_interface(self.cfg["interface"], announce=False)
 
     async def stop(self):
+        await self.set_wanted(False)
+
+    async def set_wanted(self, wanted: bool):
+        """Включает или выключает захват пакетов в зависимости от наличия клиентов"""
+        async with self.lock:
+            if wanted == self.wanted:
+                return
+            self.wanted = wanted
+            if wanted:
+                self._spawn()
+            else:
+                await self._cancel()
+
+    def _spawn(self):
+        if self.task and not self.task.done():
+            return
+        self.task = asyncio.create_task(tcpdump_reader(self.cfg))
+        self.task.add_done_callback(self._task_done)
+
+    async def _cancel(self):
         if self.task and not self.task.done():
             self.task.cancel()
             try:
                 await self.task
             except asyncio.CancelledError:
                 pass
+            except Exception as exc:
+                print(f"capture restart: {exc}")
+        self.task = None
 
     async def set_interface(self, interface: str, announce: bool = True):
         async with self.lock:
             interfaces = list_interfaces()
             if interface not in interfaces:
                 raise ValueError(f"Unknown interface: {interface}")
-            if interface == self.cfg["interface"] and self.task and not self.task.done():
-                pass
+            if interface == self.cfg["interface"]:
+                # Интерфейс не менялся: перезапускаем только если задача неожиданно завершилась
+                if self.wanted and (not self.task or self.task.done()):
+                    self._spawn()
             else:
-                old_task = self.task
                 self.cfg["interface"] = interface
-                if old_task:
-                    old_task.cancel()
-                    try:
-                        await old_task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as exc:
-                        print(f"capture restart: {exc}")
-                self.task = asyncio.create_task(tcpdump_reader(self.cfg))
-                self.task.add_done_callback(self._task_done)
+                if self.wanted:
+                    await self._cancel()
+                    self._spawn()
         if announce:
             await broadcast(runtime_config(self.cfg))
 
@@ -288,6 +308,12 @@ class CaptureController:
         self.cfg["central_host"] = host
         await broadcast(runtime_config(self.cfg))
 
+    async def _restart_after(self, delay: float):
+        await asyncio.sleep(delay)
+        async with self.lock:
+            if self.wanted:
+                self._spawn()
+
     def _task_done(self, task: asyncio.Task):
         if task.cancelled() or task is not self.task:
             return
@@ -295,6 +321,9 @@ class CaptureController:
         if exc:
             print(f"capture error: {exc}")
             asyncio.create_task(broadcast({"type": "error", "error": str(exc), "interface": self.cfg["interface"]}))
+            if self.wanted:
+                # Захват всё ещё нужен клиентам — перезапускаем tcpdump после паузы
+                asyncio.create_task(self._restart_after(CAPTURE_RESTART_DELAY))
 
 
 def parse_args() -> argparse.Namespace:
@@ -316,6 +345,8 @@ async def main():
     async def handler(ws):
         CLIENTS[ws] = asyncio.Lock()
         try:
+            # Захват пакетов нужен только при наличии хотя бы одного клиента
+            await controller.set_wanted(True)
             await safe_send(ws, runtime_config(cfg))
             async for raw in ws:
                 try:
@@ -338,6 +369,9 @@ async def main():
                         await safe_send(ws, {"type": "error", "error": str(exc)})
         finally:
             CLIENTS.pop(ws, None)
+            if not CLIENTS:
+                # Последний клиент отключился — останавливаем захват, чтобы не грузить CPU вхолостую
+                await controller.set_wanted(False)
 
     ws_server = await websockets.serve(
         handler, cfg["listen_host"], cfg["ws_port"],
